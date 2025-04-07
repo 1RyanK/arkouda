@@ -2900,3 +2900,39 @@ class Strings:
             cmd="sendArray",
             args={"values": self.entry, "hostname": hostname, "port": port, "objType": "strings"},
         )
+
+    @staticmethod
+    def concatenate_uniquely(strings: List[Strings]) -> Strings:
+        """
+        Concatenates a list of Strings into a single Strings object
+        containing only unique strings. Order may not be preserved.
+
+        Parameters
+        ----------
+        strings : List[Strings]
+            List of segmented string objects to concatenate.
+
+        Returns
+        -------
+        Strings
+            A new Strings object containing the unique values.
+        """
+
+        if not strings:
+            raise ValueError("Must provide at least one Strings object")
+
+        # Extract name of each SegmentedString
+        names = [s.name for s in strings]
+        n = len(names)
+
+        # Send the command to the server
+        rep_msg = generic_msg(
+            cmd="concatenateUniquely",
+            args={
+                "nstr": n,
+                "names": names,
+            }
+        )
+
+        return Strings.from_return_msg(cast(str, rep_msg))
+
