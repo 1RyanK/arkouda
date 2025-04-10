@@ -19,7 +19,7 @@ module ConcatenateMsg
     
     use AryUtil;
     use CTypes;
-    use Map;
+    use Set;
     
     private config const logLevel = ServerConfig.logLevel;
     private config const logChannel = ServerConfig.logChannel;
@@ -398,131 +398,193 @@ module ConcatenateMsg
     registerFunction("concatenate", concatenateMsg, getModuleName());
 
     proc concatenateUniqueStrMsg(cmd: string, msgArgs: borrowed MessageArgs, st: borrowed SymTab): MsgTuple throws {
-    param pn = Reflection.getRoutineName();
+        param pn = Reflection.getRoutineName();
 
-    var repMsg: string;
-    var n = msgArgs.get("nstr").getIntValue(); // number of arrays to process
-    var names = msgArgs.get("names").getList(n);
+        var repMsg: string;
+        var n = msgArgs.get("nstr").getIntValue(); // number of arrays to process
+        var names = msgArgs.get("names").getList(n);
 
-    cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
-                   "concatenate unique strings from %i arrays: %?".format(n, names));
+        cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
+                    "concatenate unique strings from %i arrays: %?".format(n, names));
 
-    if (n != names.size) {
-        var errorMsg = incompatibleArgumentsError(pn,
-                        "Expected %i arrays but got %i".format(n, names.size));
-        cmLogger.error(getModuleName(), getRoutineName(), getLineNumber(), errorMsg);
-        return new MsgTuple(errorMsg, MsgType.ERROR);
+        if (n != names.size) {
+            var errorMsg = incompatibleArgumentsError(pn,
+                            "Expected %i arrays but got %i".format(n, names.size));
+            cmLogger.error(getModuleName(), getRoutineName(), getLineNumber(), errorMsg);
+            return new MsgTuple(errorMsg, MsgType.ERROR);
+        }
+
+        var seenStrings = new set(string, parSafe = true); // acts as a set
+
+        // Collect all unique strings from each input SegmentedString
+        for rawName in names {
+            var (strName, _) = rawName.splitMsgToTuple('+', 2);
+            try {
+                var segString = getSegString(strName, st);
+                cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
+                            "Processing SegString: %s".format(strName));
+
+                // Convert to array of strings and populate the map
+                const strArray = extractStringsFromSegString(segString);
+                var strSet = new set(string, strArray, parSafe = true);
+                seenStrings = seenStrings | strSet;
+
+            } catch e: Error {
+                throw getErrorWithContext(
+                    msg="lookup for %s failed".format(rawName),
+                    lineNumber=getLineNumber(),
+                    routineName=getRoutineName(),
+                    moduleName=getModuleName(),
+                    errorClass="UnknownSymbolError");
+            }
+        }
+
+        // Convert set to an array of strings (unique values)
+        var uniqueArray = makeDistArray((seenStrings.size), string);
+        var seenStringsArray = seenStrings.toArray();
+        var strSizes = makeDistArray((seenStrings.size), int);
+
+        //forall idx in uniqueArray.domain with (var agg = newSrcAggregator(string), ref seenStringsArray) {
+        //    agg.copy(uniqueArray[idx], seenStringsArray[idx]);
+        //}
+
+        forall idx in uniqueArray.domain with (ref seenStringsArray) {
+            uniqueArray[idx] = seenStringsArray[idx];
+            strSizes[idx] = uniqueArray[idx].size + 1;
+        }
+
+        const nbytes: int = + reduce strSizes;
+
+        cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
+                    "Unique strings collected: %i".format(uniqueArray.size));
+
+        // Rebuild a SegmentedString from the unique values
+        //var retString = segmentedStringFromList(uniqueArray, st);
+
+        var blocksizes: [PrivateSpace] int;
+        var blockValSizes: [PrivateSpace] int;
+        var blockstarts: [PrivateSpace] int;
+        var blockValStarts: [PrivateSpace] int;
+
+        // Initialize block sizes
+        coforall loc in Locales {
+            on loc {
+                const mynsegs = uniqueArray.domain.localSubdomain().size;
+                blocksizes[here.id] = mynsegs;
+                blockValSizes[here.id] = + reduce strSizes.localSlice[strSizes.domain.localSubdomain()];
+            }
+        }
+
+        // Compute block starts
+        blockstarts = (+ scan blocksizes) - blocksizes;
+        blockValStarts = (+ scan blockValSizes) - blockValSizes;
+
+        var esegs = createTypedSymEntry(uniqueArray.size, int);
+        var evals = createTypedSymEntry(+ reduce strSizes, uint(8));
+        ref esa = esegs.a;
+        ref eva = evals.a;
+
+        coforall loc in Locales with (ref blockstarts, ref blockValStarts, ref uniqueArray) {
+            on loc {
+                // Number of strings on this locale
+                const mynsegs = uniqueArray.domain.localSubdomain().size;
+                if mynsegs > 0 {
+                    var localSegStart = blockValStarts[here.id];
+
+                    // Populate segments
+                    esegs.a[{blockstarts[here.id]..#mynsegs}] = localSegStart + (+ scan strSizes.localSlice[strSizes.domain.localSubdomain()])
+                                                                              -         strSizes[strSizes.domain.localSubdomain().low];
+
+                    // Populate values
+                    var localValStart = blockValStarts[here.id];
+                    for i in blockstarts[here.id]..#mynsegs {
+                        const str = uniqueArray[i];
+                        const strBytes = str.bytes();
+                        evals.a[{localValStart..#str.size}] = strBytes;
+                        evals.a[localValStart + str.size] = 0;
+                        localValStart += str.size + 1;
+                    }
+                }
+            }
+        }
+
+        var retString = assembleSegStringFromParts(esegs, evals, st);
+
+        // Store the result in the symbol table and return
+        repMsg = "created " + st.attrib(retString.name) + "+created bytes.size %?".format(retString.nBytes);
+
+        cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
+                    "Created unique concatenated SegmentedString: %s".format(st.attrib(retString.name)));
+
+        return new MsgTuple(repMsg, MsgType.NORMAL);
+    }
+    registerFunction("concatenateUniquely", concatenateUniqueStrMsg, getModuleName());
+
+    proc segmentedStringFromList(strs: [] string, st: borrowed SymTab): owned SegString throws {
+
+        const n = strs.size;
+
+        // Compute total number of bytes and offset array
+        var offsets: [0..<n] int;
+        var totalBytes = 0;
+
+        for i in 0..<n {
+            offsets[i] = totalBytes;
+            totalBytes += strs[i].numBytes + 1;
+        }
+
+        cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
+                    "Total strings: %i, total bytes: %i".format(n, totalBytes));
+
+        // Create entries in the symbol table
+        var segEntry = createTypedSymEntry(n, int);
+        var valEntry = createTypedSymEntry(totalBytes, uint(8));
+        ref segArr = segEntry.a;
+        ref valArr = valEntry.a;
+
+        // Fill values
+        for i in 0..<n {
+            segArr[i] = offsets[i];
+            const strBytes = strs[i].bytes();
+            for j in 0..<strBytes.size {
+                valArr[offsets[i] + j] = strBytes[j];
+            }
+            valArr[offsets[i] + strBytes.size] = 0;
+        }
+
+        // Assemble segmented string
+        var segStr = assembleSegStringFromParts(segEntry, valEntry, st);
+
+        return segStr;
     }
 
-    var seenStrings = new map(string, nothing); // acts as a set
+    proc extractStringsFromSegString(segStr: SegString): [] string throws {
 
-    // Collect all unique strings from each input SegmentedString
-    for rawName in names {
-        var (strName, _) = rawName.splitMsgToTuple('+', 2);
-        try {
-            var segString = getSegString(strName, st);
-            cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
-                           "Processing SegString: %s".format(strName));
+        const n = segStr.size;
+        const offsets = segStr.offsets.a;
+        const values = segStr.values.a;
 
-            // Convert to array of strings and populate the map
-            const strList = extractStringsFromSegString(segString);
-            forall s in strList with (ref seenStrings){
-                seenStrings[s] = none;
+        var result = makeDistArray((n), string);
+
+        forall i in 0..<n {
+            const start = offsets[i];
+            const end = if i == n - 1 then values.size else offsets[i+1];
+            const len = end - start;
+            const slice = values[start..#(end - start)];
+
+            var buf: [0..<len] c_char;
+
+            for j in 0..<len {
+                // Safe cast from uint(8) to c_char
+                buf[j] = values[start + j]:c_char;
             }
 
-        } catch e: Error {
-            throw getErrorWithContext(
-                msg="lookup for %s failed".format(rawName),
-                lineNumber=getLineNumber(),
-                routineName=getRoutineName(),
-                moduleName=getModuleName(),
-                errorClass="UnknownSymbolError");
-        }
-    }
+            const cstr: c_ptrConst(c_char) = c_ptrToConst(buf);
 
-    // Convert map keys to an array of strings (unique values)
-    var uniqueList = [key in seenStrings.keys()] key;
-
-    cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
-                   "Unique strings collected: %i".format(uniqueList.size));
-
-    // Rebuild a SegmentedString from the unique values
-    var retString = segmentedStringFromList(uniqueList, st);
-
-    // Store the result in the symbol table and return
-    repMsg = "created " + st.attrib(retString.name) + "+created bytes.size %?".format(retString.nBytes);
-
-    cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
-                   "Created unique concatenated SegmentedString: %s".format(st.attrib(retString.name)));
-
-    return new MsgTuple(repMsg, MsgType.NORMAL);
-}
-registerFunction("concatenateUniquely", concatenateUniqueStrMsg, getModuleName());
-
-proc segmentedStringFromList(strs: [] string, st: borrowed SymTab): owned SegString throws {
-
-    const n = strs.size;
-
-    // Compute total number of bytes and offset array
-    var offsets: [0..<n] int;
-    var totalBytes = 0;
-
-    for i in 0..<n {
-        offsets[i] = totalBytes;
-        totalBytes += strs[i].numBytes + 1;
-    }
-
-    cmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
-                 "Total strings: %i, total bytes: %i".format(n, totalBytes));
-
-    // Create entries in the symbol table
-    var segEntry = createTypedSymEntry(n, int);
-    var valEntry = createTypedSymEntry(totalBytes, uint(8));
-    ref segArr = segEntry.a;
-    ref valArr = valEntry.a;
-
-    // Fill values
-    for i in 0..<n {
-        segArr[i] = offsets[i];
-        const strBytes = strs[i].bytes();
-        for j in 0..<strBytes.size {
-            valArr[offsets[i] + j] = strBytes[j];
-        }
-        valArr[offsets[i] + strBytes.size] = 0;
-    }
-
-    // Assemble segmented string
-    var segStr = assembleSegStringFromParts(segEntry, valEntry, st);
-
-    return segStr;
-}
-proc extractStringsFromSegString(segStr: SegmentedString.SegString): [0..#segStr.size] string throws {
-
-    const n = segStr.size;
-    const offsets = segStr.offsets.a;
-    const values = segStr.values.a;
-
-    var result: [0..#n] string;
-
-    for i in 0..<n {
-        const start = offsets[i];
-        const end = if i == n - 1 then values.size else offsets[i+1];
-        const len = end - start;
-        const slice = values[start..#(end - start)];
-
-        var buf: [0..<len] c_char;
-
-        for j in 0..<len {
-            // Safe cast from uint(8) to c_char
-            buf[j] = values[start + j]:c_char;
+            // Use recommended API: pass c_ptrConst(c_char) to string factory
+            result[i] = string.createCopyingBuffer(cstr, policy=decodePolicy.escape);
         }
 
-        const cstr: c_ptrConst(c_char) = c_ptrToConst(buf);
-
-        // Use recommended API: pass c_ptrConst(c_char) to string factory
-        result[i] = string.createCopyingBuffer(cstr, policy=decodePolicy.escape);
+        return result;
     }
-
-    return result;
-}
 }
