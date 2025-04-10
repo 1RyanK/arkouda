@@ -492,7 +492,7 @@ module ConcatenateMsg
                     var localSegStart = blockValStarts[here.id];
 
                     // Populate segments
-                    esegs.a[{blockstarts[here.id]..#mynsegs}] = localSegStart + (+ scan strSizes.localSlice[strSizes.domain.localSubdomain()])
+                    esa[{blockstarts[here.id]..#mynsegs}] = localSegStart + (+ scan strSizes.localSlice[strSizes.domain.localSubdomain()])
                                                                               -         strSizes[strSizes.domain.localSubdomain().low];
 
                     // Populate values
@@ -500,8 +500,8 @@ module ConcatenateMsg
                     for i in blockstarts[here.id]..#mynsegs {
                         const str = uniqueArray[i];
                         const strBytes = str.bytes();
-                        evals.a[{localValStart..#str.size}] = strBytes;
-                        evals.a[localValStart + str.size] = 0;
+                        eva[{localValStart..#str.size}] = strBytes;
+                        eva[localValStart + str.size] = 0;
                         localValStart += str.size + 1;
                     }
                 }
