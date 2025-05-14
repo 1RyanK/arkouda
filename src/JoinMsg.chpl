@@ -1,5 +1,64 @@
 module JoinMsg
 {
+  // https://chapel-lang.org/docs/technotes/reduceIntents.html#readme-reduceintents-interface
+  class MergeReduceOp: ReduceScanOp {
+
+    type eltType;
+
+    var value: eltType;
+
+    proc identity    do return 0: eltType;
+
+    proc accumulate(elm) {
+      for k in elm.keys() {
+        if value.contains(k) then value[k].pushBack(elm[k]) else value[k] = elm[k];
+      }
+    }
+
+    proc accumulateOntoState(ref state, elm) {
+      for k in elm.keys() {
+        if state.contains(k) then state[k].pushBack(elm[k]) else state[k] = elm[k];
+      }
+    }
+
+    proc combine(other: borrowed MergeReduceOp(?)) {
+      for k in other.value.keys() {
+        if value.contains(k) then value[k].pushBack(other.value[k]) else value[k] = other.value[k];
+      }
+    }
+
+    proc generate()    do return value;
+
+    proc clone()    do return new unmanaged MergeReduceOp(eltType=eltType);
+
+  }
+
+  class AppendReduceOp: ReduceScanOp {
+
+    type eltType;
+
+    var value: eltType;
+
+    proc identity    do return 0: eltType;
+
+    proc accumulate(elm) {
+      value.pushBack(elm);
+    }
+
+    proc accumulateOntoState(ref state, elm) {
+      state.pushBack(elm);
+    }
+
+    proc combine(other: borrowed MergeReduceOp(?)) {
+      value.pushBack(other.value);
+    }
+
+    proc generate()    do return value;
+
+    proc clone()    do return new unmanaged MergeReduceOp(eltType=eltType);
+
+  }
+
   use ServerConfig;
 
   use Time;
@@ -190,7 +249,7 @@ module JoinMsg
     var maxBytesSendingLeft = 0;
     var maxBytesSendingRight = 0;
     var rowIndexInLocLeft: [PrivateSpace] list(int);
-    var rowIndexInLocRIght: [PrivateSPace] list(int);
+    var rowIndexInLocRIght: [PrivateSpace] list(int);
     var byteOffsetInLocLeft: [PrivateSpace] list(int);
     var byteOffsetInLocRight: [PrivateSpace] list(int);
 
@@ -657,7 +716,156 @@ module JoinMsg
 
     }
 
+    var howManyRowsPerLoc: [PrivateSpace] int;
+    var joinData: [PrivateSpace] list(4*int);
+
     coforall loc in Locales do on loc {
+
+      var hashMap = new map(int(64), list(2*int));
+      var numRowsReceivedLeft: [0..#numLocales] int;
+      var numRowsReceivedRight: [0..#numLocales] int;
+      var numBytesReceivedLeft: [0..#numLocales] int;
+      var numBytesReceivedRight: [0..#numLocales] int;
+      forall i in 0..#numLocales {
+        numRowsReceivedLeft[i] = numRowsSendingLeftByLoc[i][here.id];
+        numRowsReceivedRight[i] = numRowsSendingRightByLoc[i][here.id];
+        numBytesReceivedLeft[i] = numStrBytesSendingLeftByLoc[i][here.id];
+        numBytesReceivedRight[i] = numStrBytesSendingRightByLoc[i][here.id];
+      }
+      // Ideally the following could be done with better parallelism, but I'm not sure that it can...
+      // Maybe if I read out all the data from all the other locales into a single thing, but that just sounds kind of messy.
+      // Actually maybe this is fine. forall over the rows, then forall over the keys is fine because we can avoid race conditions.
+      for i in 0..#numLocales {
+        const rows = numRowsReceivedLeft[i];
+        var currMap = new map(int(64), list(2*int));
+        const startInd = rows * (leftColCounts[3] - 1);
+        forall j in 0..#rows with (MergeReduceOp reduce currMap) {
+          var h = int64LeftRecvBuffer[here.id][i][startInd + j];
+          if currMap.contains(h) do currMap[h].pushBack( (i, j) ) else currMap[h] = new list( [ (i, j) ] );
+        }
+        forall k in currMap.keys() {
+          if hashMap.contains(k) then hashMap[k].pushBack(currMap[k]) else hashmap[k] = currMap[k];
+        }
+      }
+
+      var matches = new list(4*int);
+
+      for i in 0..#numLocales {
+
+        var currList = new list(4*int);
+        const rows = numRowsReceivedRight[i];
+        const startInd = rows * (rightColCounts[3] - 1);
+        forall j in 0..#rows with (AppendReduceOp reduce currList) {
+          var h = int64RightRecvBuffer[here.id][i][startInd + j];
+          if hashMap.contains(h) {
+            var tuples = hashMap[h];
+            for tup in tuples {
+              var leftLoc = tup[0];
+              var leftRow = tup[1];
+              var leftRowCount = numRowsReceivedLeft[leftLoc];
+              var tupleWorks = true;
+              for leftKeyInd, rightKeyInd in zip(leftKeyInds, rightKeyInd) {
+                var leftCol = leftkeyInd[1];
+                var rightCol = rightKeyInd[1];
+                // Could this be done with the c_ptrTo and the ref kind of thing? Yes
+                // Do I want to do that here? Not really
+                select leftKeyInd[0] {
+                  when 0 {
+                    if int8LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != int8RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 1 {
+                    if int16LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != int16RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 2 {
+                    if int32LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != int32RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 3 {
+                    if int64LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != int64RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 4 {
+                    if uint8LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != uint8RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 5 {
+                    if uint16LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != uint16RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 6 {
+                    if uint32LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != uint32RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 7 {
+                    if uint64LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != uint64RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 8 {
+                    if boolLeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != boolRightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 9 {
+                    if real32LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != real32RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 10 {
+                    if real64LeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow] != real64RightRecvBuffer[here.id][i][rightCol * rows + j] {
+                      tupleWorks = false;
+                      break;
+                    }
+                  }
+                  when 11 {
+                    const leftStartInd = stringOffsetLeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow];
+                    const leftEndInd = if leftRow == leftRowCount - 1 then numBytesReceivedLeft[leftLoc] else stringOffsetLeftRecvBuffer[here.id][leftLoc][leftCol * leftRowCount + leftRow + 1];
+                    const rightStartInd = stringOffsetRightRecvBuffer[here.id][i][rightCol * rows + j];
+                    const rightEndInd = if j == rows - 1 then numBytesReceivedRight[i] else stringOffsetRightRecvBuffer[here.id][i][rightCol * rows + j + 1];
+                    for leftInd, rightInd in zip(leftStartInd..<leftEndInd, rightStartInd..<rightEndInd) {
+                      if stringBytesLeftRecvBuffer[here.id][leftLoc][leftInd] != stringBytesRightRecvBuffer[here.id][i][rightInd] {
+                        tupleWorks = false;
+                        break;
+                      }
+                    }
+                    if !tupleWorks {
+                      break;
+                    }
+                  }
+                }
+              }
+              if tupleWorks {
+                currList.pushBack( (leftLoc, leftRow, i, j) );
+              }
+            }
+          }
+        }
+
+        matches.pushBack(currList);
+
+      }
+
+      joinData[here.id] = matches;
+      howManyRowsPerLoc[here.id] = matches.size;
 
     }
 
