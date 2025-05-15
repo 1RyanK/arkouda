@@ -104,7 +104,7 @@ module JoinMsg
   proc joinMsg(cmd: string, msgArgs: borrowed MessageArgs, st: borrowed SymTab): MsgTuple throws {
     param pn = Reflection.getRoutineName();
 
-    var repMsg: string;
+    var repMsg: string = "";
     const nArraysLeft = msgArgs["nArraysLeft"].toScalar(int),
       namesLeft = msgArgs["namesLeft"].toScalarArray(string, nArrays),
       nArraysRight = msgArgs["nArraysRight"].toScalar(int),
@@ -127,6 +127,8 @@ module JoinMsg
     var rightColCounts = 12 * int;
     var leftKeyInds = [0..#nMerging] 2 * int;
     var rightKeyInds = [0..#nMerging] 2 * int;
+    var leftOrderProcessing: [0..#nArraysLeft] 2 * int;
+    var rightOrderProcessing: [0..#nArraysRight] 2 * int;
 
     var dtypeToIntMap = new map(DType, int);
     dtypeToIntMap[DType.Int8] = 0;
@@ -170,6 +172,7 @@ module JoinMsg
       var genEntry = getGenericTypedArrayEntry(namesLeft[i], st);
 
       var dtype: DType = genEntry.dtype;
+      leftOrderProcessing[i] = (dtypeToIntMap[dtype], leftColCounts[dtypeToIntMap[dtype]]);
       leftColCounts[dtypeToIntMap[dtype]] += 1;
       var idx = mergeLeft.find(i);
       baseRowBytesLeft += bytesPerType[dtypeToIntMap[dtype]];
@@ -201,6 +204,7 @@ module JoinMsg
       var genEntry = getGenericTypedArrayEntry(namesRight[i], st);
       
       var dtype: DType = genEntry.dtype;
+      rightOrderProcessing[i] = (dtypeToIntMap[dtype], rightColCounts[dtypeToIntMap[dtype]]);
       rightColCounts[dtypeToIntMap[dtype]] += 1;
       var idx = mergeRight.find(i);
       baseRowBytesRight += bytesPerType[dtypeToIntMap[dtype]];
@@ -719,6 +723,13 @@ module JoinMsg
     var howManyRowsPerLoc: [PrivateSpace] int;
     var joinData: [PrivateSpace] list(4*int);
 
+    var numBytesLeftPerColByLocale: [PrivateSpace] [0..#leftColCounts[11]] int;
+    var numBytesRightPerColByLocale: [PrivateSpace] [0..#rightColCounts[11]] int;
+    var numRowsReceivedLeftByLoc: [PrivateSpace] [0..#numLocales] int;
+    var numRowsReceivedRightByLoc: [PrivateSpace] [0..#numLocales] int;
+    var numBytesReceivedLeftByLoc: [PrivateSpace] [0..#numLocales] int;
+    var numBytesReceivedRightByLoc: [PrivateSpace] [0..#numLocales] int;
+
     coforall loc in Locales do on loc {
 
       var hashMap = new map(int(64), list(2*int));
@@ -732,6 +743,10 @@ module JoinMsg
         numBytesReceivedLeft[i] = numStrBytesSendingLeftByLoc[i][here.id];
         numBytesReceivedRight[i] = numStrBytesSendingRightByLoc[i][here.id];
       }
+      numRowsReceivedLeftByLoc[here.id] = numRowsReceivedLeft;
+      numRowsReceivedRightByLoc[here.id] = numRowsReceivedRight;
+      numBytesReceivedLeftByLoc[here.id] = numBytesReceivedLeft;
+      numBytesReceivedRightByLoc[here.id] = numBytesReceivedRight;
       // Ideally the following could be done with better parallelism, but I'm not sure that it can...
       // Maybe if I read out all the data from all the other locales into a single thing, but that just sounds kind of messy.
       // Actually maybe this is fine. forall over the rows, then forall over the keys is fine because we can avoid race conditions.
@@ -755,7 +770,9 @@ module JoinMsg
         var currList = new list(4*int);
         const rows = numRowsReceivedRight[i];
         const startInd = rows * (rightColCounts[3] - 1);
-        forall j in 0..#rows with (AppendReduceOp reduce currList) {
+        var strLensLeftByCol: [0..#leftColCounts[11]] int;
+        var strLensRightByCol: [0..#rightColCounts[11]] int;
+        forall j in 0..#rows with (AppendReduceOp reduce currList, + reduce strLensLeftByCol, + reduce strLensRightByCol) {
           var h = int64RightRecvBuffer[here.id][i][startInd + j];
           if hashMap.contains(h) {
             var tuples = hashMap[h];
@@ -855,18 +872,241 @@ module JoinMsg
               }
               if tupleWorks {
                 currList.pushBack( (leftLoc, leftRow, i, j) );
+                for k in 0..#leftColCounts[11] {
+                  const start = stringOffsetLeftRecvBuffer[here.id][leftLoc][k * leftRowCount + leftRow];
+                  const end = if leftRow == leftRowCount - 1 then numBytesReceivedLeft[leftLoc] else stringOffsetLeftRecvBuffer[here.id][leftLoc][k * leftRowCount + leftRow + 1];
+                  strLensLeftByCol[k] += end - start;
+                }
+                for k in 0..#rightColCounts[11] {
+                  const start = stringOffsetRightRecvBuffer[here.id][i][k * rows + j];
+                  const end = if j == rows - 1 then numBytesReceivedRight[i] else stringOffsetRightRecvBuffer[here.id][i][k * rows + j + 1];
+                  strLensRightByCol[k] += end - start;
+                }
               }
             }
           }
         }
 
         matches.pushBack(currList);
+        numBytesLeftPerColByLocale[here.id] += strLensLeftByCol;
+        numBytesRightPerColByLocale[here.id] += strLensRightByCol;
 
       }
 
       joinData[here.id] = matches;
       howManyRowsPerLoc[here.id] = matches.size;
 
+    }
+
+    var locOffsetsInOutput = (+ scan howManyRowsPerLoc) - howManyRowsPerLoc;
+    var numRowsInOutput = + reduce howManyRowsPerLoc;
+
+    for colData in leftOrderProcessing {
+      const colType = colData[0];
+      const colInd = colData[1];
+      
+      if colType != 11 {
+        var rname = st.nextName();
+        ref arrLeft;
+        ref arrRight;
+        select colType {
+          when 0 {
+            arrLeft = int8LeftRecvBuffer;
+          }
+          when 1 {
+            arrLeft = int16LeftRecvBuffer;
+          }
+          when 2 {
+            arrLeft = int32LeftRecvBuffer;
+          }
+          when 3 {
+            arrLeft = int64LeftRecvBuffer;
+          }
+          when 4 {
+            arrLeft = uint8LeftRecvBuffer;
+          }
+          when 5 {
+            arrLeft = uint16LeftRecvBuffer;
+          }
+          when 6 {
+            arrLeft = uint32LeftRecvBuffer;
+          }
+          when 7 {
+            arrLeft = uint64LeftRecvBuffer;
+          }
+          when 8 {
+            arrLeft = boolLeftRecvBuffer;
+          }
+          when 9 {
+            arrLeft = real32LeftRecvBuffer;
+          }
+          when 10 {
+            arrLeft = real64LeftRecvBuffer;
+          }
+        }
+        var e = st.addEntry(rname, numRowsInOutput, arrayTypes[colType]);
+        coforall loc in Locales do on loc {
+          var locArray: [0..#howManyRowsPerLoc[here.id]] arrayTypes[colType];
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            locArray[idx] = arrLeft[here.id][loc][colInd * numRowsReceivedLeftByLoc[here.id][loc] + row];
+          }
+          e.a[locOffsetsInOutput[here.id]..#howManyRowsPerLoc[here.id]] = locArray;
+        }
+        repMsg += "created " + st.attrib(rname) + ";;;";
+      }
+      else {
+
+        var nBytes = 0;
+        var numBytesLeftThisColByLocale: [0..#numLocales] int;
+        var byteOffsetArrByLocale: [0..#numLocales] int;
+        forall i in 0..#numLocales with (+ reduce nBytes){
+          nBytes += numBytesLeftPerColByLocale[i][colInd];
+          numBytesLeftThisColByLocale[i] = numBytesLeftThisColByLocale[i][colInd];
+        }
+        byteOffsetArrByLocale = (+ scan numBytesLeftThisColByLocale) - numBytesLeftThisColByLocale;
+
+        var esegs = createTypedSymEntry(numRowsInOutput, int);
+        var evals = createTypedSymEntry(nBytes, uint(8));
+        ref esa = esegs.a;
+        ref eva = evals.a;
+        var retString = assembleSegStringFromParts(esegs, evals, st);
+
+        coforall loc in Locales do on loc {
+          var locArrayOfSizes: [0..#howManyRowsPerLoc[here.id]] int;
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            const start = stringOffsetLeftRecvBuffer[here.id][loc][colInd * numRowsReceivedLeftByLoc[here.id][loc] + row];
+            const end = if row == numRowsReceivedLeftByLoc[here.id][loc] - 1 then numBytesReceivedLeftByLoc[here.id][loc] else stringOffsetLeftRecvBuffer[here.id][loc][colInd * numRowsReceivedLeftByLoc[here.id][loc] + row + 1];
+            locArrayOfSizes[idx] = end - start;
+          }
+          var locArrayOfOffsets = (+ scan locArrayOfSizes) - locArrayOfSizes + byteOffsetArrByLocale[here.id];
+          var locMyBytes: [0..#numBytesLeftThisColByLocale[here.id]] uint(8);
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            const start = stringOffsetLeftRecvBuffer[here.id][loc][colInd * numRowsReceivedLeftByLoc[here.id][loc] + row];
+            const locStart = locArrayOfOffsets[idx];
+            const end = start + locArrayOfSizes[idx];
+            const locEnd = locStart + locArrayOfOffsets[idx];
+            locMyBytes[locStart..<locEnd] = stringBytesLeftRecvBuffer[here.id][loc][start..<end];
+          }
+          esa[locOffsetsInOutput[here.id]..#howManyRowsPerLoc[here.id]] = locArrayOfOffsets;
+          eva[byteOffsetArrByLocale[here.id]..#numBytesLeftThisColByLocale[here.id]] = locMyBytes;
+        }
+
+        repMsg += "created " + st.attrib(retString.name) + "+created bytes.size %?;;;".format(retString.nBytes);
+
+      }
+    }
+
+    for colData in rightOrderProcessing {
+      const colType = colData[0];
+      const colInd = colData[1];
+      
+      if colType != 11 {
+        var rname = st.nextName();
+        ref arrRight;
+        ref arrRight;
+        select colType {
+          when 0 {
+            arrRight = int8RightRecvBuffer;
+          }
+          when 1 {
+            arrRight = int16RightRecvBuffer;
+          }
+          when 2 {
+            arrRight = int32RightRecvBuffer;
+          }
+          when 3 {
+            arrRight = int64RightRecvBuffer;
+          }
+          when 4 {
+            arrRight = uint8RightRecvBuffer;
+          }
+          when 5 {
+            arrRight = uint16RightRecvBuffer;
+          }
+          when 6 {
+            arrRight = uint32RightRecvBuffer;
+          }
+          when 7 {
+            arrRight = uint64RightRecvBuffer;
+          }
+          when 8 {
+            arrRight = boolRightRecvBuffer;
+          }
+          when 9 {
+            arrRight = real32RightRecvBuffer;
+          }
+          when 10 {
+            arrRight = real64RightRecvBuffer;
+          }
+        }
+        var e = st.addEntry(rname, numRowsInOutput, arrayTypes[colType]);
+        coforall loc in Locales do on loc {
+          var locArray: [0..#howManyRowsPerLoc[here.id]] arrayTypes[colType];
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            locArray[idx] = arrRight[here.id][loc][colInd * numRowsReceivedRightByLoc[here.id][loc] + row];
+          }
+          e.a[locOffsetsInOutput[here.id]..#howManyRowsPerLoc[here.id]] = locArray;
+        }
+        repMsg += "created " + st.attrib(rname) + ";;;";
+      }
+      else {
+
+        var nBytes = 0;
+        var numBytesRightThisColByLocale: [0..#numLocales] int;
+        var byteOffsetArrByLocale: [0..#numLocales] int;
+        forall i in 0..#numLocales with (+ reduce nBytes){
+          nBytes += numBytesRightPerColByLocale[i][colInd];
+          numBytesRightThisColByLocale[i] = numBytesRightThisColByLocale[i][colInd];
+        }
+        byteOffsetArrByLocale = (+ scan numBytesRightThisColByLocale) - numBytesRightThisColByLocale;
+
+        var esegs = createTypedSymEntry(numRowsInOutput, int);
+        var evals = createTypedSymEntry(nBytes, uint(8));
+        ref esa = esegs.a;
+        ref eva = evals.a;
+        var retString = assembleSegStringFromParts(esegs, evals, st);
+
+        coforall loc in Locales do on loc {
+          var locArrayOfSizes: [0..#howManyRowsPerLoc[here.id]] int;
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            const start = stringOffsetRightRecvBuffer[here.id][loc][colInd * numRowsReceivedRightByLoc[here.id][loc] + row];
+            const end = if row == numRowsReceivedRightByLoc[here.id][loc] - 1 then numBytesReceivedRightByLoc[here.id][loc] else stringOffsetRightRecvBuffer[here.id][loc][colInd * numRowsReceivedRightByLoc[here.id][loc] + row + 1];
+            locArrayOfSizes[idx] = end - start;
+          }
+          var locArrayOfOffsets = (+ scan locArrayOfSizes) - locArrayOfSizes + byteOffsetArrByLocale[here.id];
+          var locMyBytes: [0..#numBytesRightThisColByLocale[here.id]] uint(8);
+          forall idx in joinData[here.id].domain {
+            const tup = joinData[here.id][idx];
+            const loc = tup[0];
+            const row = tup[1];
+            const start = stringOffsetRightRecvBuffer[here.id][loc][colInd * numRowsReceivedRightByLoc[here.id][loc] + row];
+            const locStart = locArrayOfOffsets[idx];
+            const end = start + locArrayOfSizes[idx];
+            const locEnd = locStart + locArrayOfOffsets[idx];
+            locMyBytes[locStart..<locEnd] = stringBytesRightRecvBuffer[here.id][loc][start..<end];
+          }
+          esa[locOffsetsInOutput[here.id]..#howManyRowsPerLoc[here.id]] = locArrayOfOffsets;
+          eva[byteOffsetArrByLocale[here.id]..#numBytesRightThisColByLocale[here.id]] = locMyBytes;
+        }
+
+        repMsg += "created " + st.attrib(retString.name) + "+created bytes.size %?;;;".format(retString.nBytes);
+
+      }
     }
 
     return new MsgTuple(repMsg, MsgType.NORMAL);
