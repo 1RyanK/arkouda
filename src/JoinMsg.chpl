@@ -1,6 +1,7 @@
 module JoinMsg
 {
   // https://chapel-lang.org/docs/technotes/reduceIntents.html#readme-reduceintents-interface
+  // This is meant to take maps from ints to lists and join them together by appending lists where keys match.
   class MergeReduceOp: ReduceScanOp {
 
     type eltType;
@@ -33,6 +34,7 @@ module JoinMsg
 
   }
 
+  // This takes lists and appends them together.
   class AppendReduceOp: ReduceScanOp {
 
     type eltType;
@@ -87,11 +89,15 @@ module JoinMsg
 
   use CommandMap;
 
+  // Fills a send buffer with data to be sent to other locales.
   proc fillSendBuffer(ref sendBuffer, ref data, ref destLocales, ref rowIndexInSendBuffer, ref numRowsToLoc, numColsThisType: int, numRowsInLocale: int) {
-    forall i in 0..#numRowsInLocale with (ref sendBuffer, ref rowIndexInSendBuffer) {
-      const destLoc = destLocales[i];
-      const rowIdx = rowIndexInSendBuffer[i];
 
+    // Parallel loop over rows in the local data
+    forall i in 0..#numRowsInLocale with (ref sendBuffer, ref rowIndexInSendBuffer) {
+      const destLoc = destLocales[i]; // Destination locale for this row
+      const rowIdx = rowIndexInSendBuffer[i]; // Row index in the send buffer for the destination
+
+      // Loop over columns of this data type
       for j in 0..#numColsThisType {
 
         // Copy the data from the local array to the send buffer for the destination locale
@@ -101,6 +107,7 @@ module JoinMsg
     }
   }
 
+  // Main function to handle a "join" command between two distributed DataFrames
   proc joinMsg(cmd: string, msgArgs: borrowed MessageArgs, st: borrowed SymTab): MsgTuple throws {
     param pn = Reflection.getRoutineName();
 
@@ -117,12 +124,15 @@ module JoinMsg
 
     jmLogger.debug(getModuleName(), getRoutineName(), getLineNumber(),
                   "Joining two DataFrames on %i columns".format(nMerging));
-    
+
+    // Define possible data types for columns
     type arrayTypes = (int(8), int(16), int(32), int(64), uint(8), uint(16), uint(32), uint(64), bool, real(32), real(64), string);
     type cPtrTypes = (int(8), int(16), int(32), int(64), uint(8), uint(16), uint(32), uint(64), bool, real(32), real(64), int(64));
 
+    // Following the ordering above, how many bytes are in each of those types (excluding strings, which are calculated separately)
     var bytesPerType = [1, 2, 4, 8, 1, 2, 4, 8, 1, 4, 8, 0];
 
+    // Arrays to track column counts and key indices for left and right DataFrames
     var leftColCounts = 12 * int;
     var rightColCounts = 12 * int;
     var leftKeyInds = [0..#nMerging] 2 * int;
@@ -130,6 +140,7 @@ module JoinMsg
     var leftOrderProcessing: [0..#nArraysLeft] 2 * int;
     var rightOrderProcessing: [0..#nArraysRight] 2 * int;
 
+    // Map from DType enum to integer index (used for type lookup into arrayTypes/cPtrTypes)
     var dtypeToIntMap = new map(DType, int);
     dtypeToIntMap[DType.Int8] = 0;
     dtypeToIntMap[DType.Int16] = 1;
@@ -144,6 +155,7 @@ module JoinMsg
     dtypeToIntMap[DType.Float64] = 10;
     dtypeToIntMap[DType.Strings] = 11;
 
+    // Map from Chapel types to integer index (used for type lookup into arrayTypes/cPtrTypes)
     var typeToIntMap = new map(type, int);
     typeToIntMap[int(8)] = 0;
     typeToIntMap[int(16)] = 1;
@@ -161,27 +173,38 @@ module JoinMsg
     var leftSize = -1;
     var rightSize = -1;
 
+    // Number of bytes per row (and number of key bytes per row), excluding strings
     var baseRowBytesLeft = 0;
     var baseKeyBytesLeft = 0;
 
-    // We are going to store the hash of the key as a column. Then I don't have to recompute it.
+    // Add an extra column to store the hash of the join key in the left DataFrame
     leftColCounts[3] += 1;
 
+    // Process each column in the left DataFrame
     for i in 0..#nArraysLeft {
 
       var genEntry = getGenericTypedArrayEntry(namesLeft[i], st);
-
       var dtype: DType = genEntry.dtype;
+
+      // Record the type and current index for this column
       leftOrderProcessing[i] = (dtypeToIntMap[dtype], leftColCounts[dtypeToIntMap[dtype]]);
       leftColCounts[dtypeToIntMap[dtype]] += 1;
+
+      // Check if this column is a join key
       var idx = mergeLeft.find(i);
+
+      // Update the number of bytes per row
       baseRowBytesLeft += bytesPerType[dtypeToIntMap[dtype]];
 
-      if idx != -1 {
+      if idx != -1 { // This column is a key column
+        // Track where the key column will be stored
         leftKeyInds[idx] = (dtypeToIntMap[dtype], leftColCounts[dtypeToIntMap[dtype]] - 1);
+
+        // Update the number of bytes per row
         baseKeyBytesLeft += bytesPerType[dtypeToIntMap[dtype]];
       }
 
+      // Ensure all columns in the left DataFrame have the same number of rows
       if leftSize != -1  && genEntry.size != leftSize {
 
         const errMsg = "All columns in a given DataFrame must have the same size.";
@@ -194,6 +217,8 @@ module JoinMsg
 
     }
 
+    // Do this again for the right side.
+
     var baseRowBytesRight = 0;
     var baseKeyBytesRight = 0;
 
@@ -202,15 +227,18 @@ module JoinMsg
     for i in 0..#nArraysRight {
 
       var genEntry = getGenericTypedArrayEntry(namesRight[i], st);
-      
       var dtype: DType = genEntry.dtype;
+
       rightOrderProcessing[i] = (dtypeToIntMap[dtype], rightColCounts[dtypeToIntMap[dtype]]);
       rightColCounts[dtypeToIntMap[dtype]] += 1;
+
       var idx = mergeRight.find(i);
+
       baseRowBytesRight += bytesPerType[dtypeToIntMap[dtype]];
 
       if idx != -1 {
         rightKeyInds[idx] = (dtypeToIntMap[dtype], rightColCounts[dtypeToIntMap[dtype]] - 1);
+
         baseKeyBytesRight += bytesPerType[dtypeToIntMap[dtype]];
       }
 
@@ -226,6 +254,9 @@ module JoinMsg
 
     }
 
+    // Ensure that all corresponding join key columns have the same type
+    // This is not what pandas does. However, because we hash based on bits, and ints and reals are stored differently even for the same values,
+    // this kind of has to happen as far as I can tell.
     for i in 0..#nMerging {
       if leftKeyInds[i][0] != rightKeyInds[i][0] {
         const errMsg = "All corresponding merge columns must have the same type.";
@@ -234,24 +265,39 @@ module JoinMsg
       }
     }
 
+    // Pointers to raw data arrays for each type on each locale
     var leftDataRefs: [PrivateSpace] [0..11] c_ptr(void);
     var rightDataRefs: [PrivateSpace] [0..11] c_ptr(void);
+
+    // Number of elements per locale for left and right DataFrames
     var leftNumElemsPerLocale: [PrivateSpace] int;
     var rightNumElemsPerLocale: [PrivateSpace] int;
-    var leftSampleArray = makeDistArray(leftSize, int); // I need to set up a sample distributed array
-    var rightSampleArray = makeDistArray(rightSize, int); // I can use this to quickly figure out how many values are on each locale
+
+    // Sample distributed arrays used to infer data distribution across locales
+    var leftSampleArray = makeDistArray(leftSize, int);
+    var rightSampleArray = makeDistArray(rightSize, int);
+
+    // Buffers for storing string byte data per locale
     var leftStrBytes: [PrivateSpace] list(uint(8));
     var rightStrBytes: [PrivateSpace] list(uint(8));
+
+    // Destination locale mapping for each row
     var destLocByRowLeft: [PrivateSpace] list(int);
     var destLocByRowRight: [PrivateSpace] list(int);
+
+    // Number of rows and string bytes to send to each locale
     var numRowsSendingLeftByLoc: [PrivateSpace] [0..#numLocales] int;
     var numRowsSendingRightByLoc: [PrivateSpace] [0..#numLocales] int;
     var numStrBytesSendingLeftByLoc: [PrivateSpace] [0..#numLocales] int;
     var numStrBytesSendingRightByLoc: [PrivateSpace] [0..#numLocales] int;
+
+    // Max values used for buffer sizing
     var maxRowsSendingLeft = 0;
     var maxRowsSendingRight = 0;
     var maxBytesSendingLeft = 0;
     var maxBytesSendingRight = 0;
+
+    // Row and byte offsets for each locale
     var rowIndexInLocLeft: [PrivateSpace] list(int);
     var rowIndexInLocRIght: [PrivateSpace] list(int);
     var byteOffsetInLocLeft: [PrivateSpace] list(int);
@@ -260,12 +306,15 @@ module JoinMsg
     coforall loc in Locales do on loc
       with (max reduce maxRowsSendingLeft, max reduce maxRowsSendingRight, max reduce maxBytesSendingLeft, max reduce maxBytesSendingRight) {
 
+      // Determine how many elements are on this locale
       leftNumElemsPerLocale[here.id] = leftSampleArray.localSubdomain().size;
       rightNumElemsPerLocale[here.id] = rightSampleArray.localSubdomain().size;
 
+      // Offsets for string byte buffers
       var leftStrBytesBufferOffsets: [0..#leftColCounts[11]] int;
       var rightStrBytesBufferOffsets: [0..#rightColCounts[11]] int;
 
+      // Actually creates the arrays by type
       for t in arrayTypes {
         var typeNum = typesToIntMap[t];
         type ct = cPtrTypes[typeNum];
@@ -275,6 +324,7 @@ module JoinMsg
         rightDataRefs[here.id][typeNum] = c_addrOf(rightArr);
       }
 
+      // Track the number of arrays processed by type so we know where to put them
       var leftColsProcessed: [0..11] int;
       var rightColsProcessed: [0..11] int;
 
@@ -283,24 +333,39 @@ module JoinMsg
         var dtype: DType = getGenericTypedArrayEntry(namesLeft[i], st).dtype;
         var ind = dtypeToIntMap[dtype];
 
-        if ind < 11 {
+        if ind < 11 { // Non-string type
           var arr = st[namesLeft[i]]: borrowed SymEntry(arrayTypes[ind], 1);
           var currBlock = leftColsProcessed[ind];
           ref arr = (leftDataRefs[here.id][ind]:c_ptr([0..#(leftNumElemsPerLocale[here.id]*leftColCounts[ind])] cPtrTypes[ind])).deref();
+
+          // Copy as a large, contiguous block of memory
           arr[currblock*leftNumElemsPerLocale[here.id]..#leftNumElemsPerLocale[here.id]] = arr.a.localSlice[arr.a.domain.localSubdomain()];
           leftColsProcessed[ind] += 1;
-        } else {
+        } else { // Type is string
+
           var (strName, _) = namesLeft[i].splitMsgToTuple('+', 2);
           var segString = getSegString(strName, st);
+
           const offsetsDom = segString.offsets.a.domain.localSubdomain();
           ref globalOffsets = segString.offsets.a;
           var currBlock = leftColsProcessed[ind];
           ref arr = (leftDataRefs[here.id][ind]:c_ptr([0..#(leftNumElemsPerLocale[here.id]*leftColCounts[ind])] cPtrTypes[ind])).deref();
+
+          // We need the offsets as well as the actual data in bytes
+          // offsets is the offset into the array that was passed in
           var offsets = segString.offsets.a.localSlice[offsetsDom];
+
+          // offsets2 shifts the offsets to be relative to our array of offsets we created
           var offsets2 = offsets - offsets[0] + arr[leftNumElemsPerLocale[here.id]*currBlock - (if currBlock > 0 then 1 else 0)];
+
+          // topEnd and topEnd2 are the "end" offsets of offsets and offsets2 respectively
           var topEnd = if offsetsDom.high >= segString.offsets.a.domain.high then segString.values.a.size else globalOffsets[offsetsDom.high + 1];
           var topEnd2 = topEnd - offsets[0] + arr[leftNumElemsPerLocale[here.id]*currBlock - (if currBlock > 0 then 1 else 0)];
+
+          // I'm keeping track of where each column ends, not sure how much help this is, but it's there
           leftStrBytesBufferOffsets[currBlock] = topEnd2;
+
+          // Copy the offsets and then the individual bytes
           arr[currblock*leftNumElemsPerLocale[here.id]..#leftNumElemsPerLocale[here.id]] = offsets2;
           var byteData = segString.values.a[offsets[0]..<topEnd];
           if currBlock == 0 {
@@ -313,6 +378,8 @@ module JoinMsg
 
       }
 
+      // Works much the same as above
+
       for i in 0..#nArraysRight {
 
         var dtype: DType = getGenericTypedArrayEntry(namesRight[i], st).dtype;
@@ -322,20 +389,26 @@ module JoinMsg
           var arr = st[namesRight[i]]: borrowed SymEntry(arrayTypes[ind], 1);
           var currBlock = rightColsProcessed[ind];
           ref arr = (rightDataRefs[here.id][ind]:c_ptr([0..#(rightNumElemsPerLocale[here.id]*rightColCounts[ind])] cPtrTypes[ind])).deref();
+
           arr[currblock*rightNumElemsPerLocale[here.id]..#rightNumElemsPerLocale[here.id]] = arr.a.localSlice[arr.a.domain.localSubdomain()];
           rightColsProcessed[ind] += 1;
         } else {
+
           var (strName, _) = namesRight[i].splitMsgToTuple('+', 2);
           var segString = getSegString(strName, st);
+
           const offsetsDom = segString.offsets.a.domain.localSubdomain();
           ref globalOffsets = segString.offsets.a;
           var currBlock = rightColsProcessed[ind];
           ref arr = (rightDataRefs[here.id][ind]:c_ptr([0..#(rightNumElemsPerLocale[here.id]*rightColCounts[ind])] cPtrTypes[ind])).deref();
+
           var offsets = segString.offsets.a.localSlice[offsetsDom];
           var offsets2 = offsets - offsets[0] + arr[rightNumElemsPerLocale[here.id]*currBlock - (if currBlock > 0 then 1 else 0)];
           var topEnd = if offsetsDom.high >= segString.offsets.a.domain.high then segString.values.a.size else globalOffsets[offsetsDom.high + 1];
           var topEnd2 = topEnd - offsets[0] + arr[rightNumElemsPerLocale[here.id]*currBlock - (if currBlock > 0 then 1 else 0)];
+
           rightStrBytesBufferOffsets[currBlock] = topEnd2;
+
           arr[currblock*rightNumElemsPerLocale[here.id]..#rightNumElemsPerLocale[here.id]] = offsets2;
           var byteData = segString.values.a[offsets[0]..<topEnd];
           if currBlock == 0 {
@@ -348,12 +421,16 @@ module JoinMsg
 
       }
 
+      // Now we figure out which locale each row from the left and right is going to
+
       var destLocsLeft: [0..#leftNumElemsPerLocale[here.id]] int;
       var strBytesByRowLeft: [0..#leftNumElemsPerLocale[here.id]] int;
       var strBytesByElemLeft: [0..#(leftNumElemsPerLocale[here.id] * leftColCounts[11])] int;
       var strBytesArrLeft = leftStrBytes[here.id].toArray();
 
       forall i in 0..#leftNumElemsPerLocale[here.id] {
+
+        // Start by figuring out the number of string bytes this row
 
         var strBytesThisRow = 0;
         var keyStrBytesThisRow = 0;
@@ -370,6 +447,8 @@ module JoinMsg
 
         strBytesByRowLeft[i] = strBytesThisRow;
 
+        // Now figure out how many string bytes we're merging on
+
         for j in 0..#nMerging {
 
           var currKey = leftKeyInds[j];
@@ -382,6 +461,8 @@ module JoinMsg
 
         }
 
+        // Essentially serialize the data into bytes and store it in this array
+
         var keyBytes: [0..#(baseKeyBytesLeft + keyStrBytesThisRow)] uint(8);
         var currByte = 0;
 
@@ -390,8 +471,12 @@ module JoinMsg
           var currKey = leftKeyInds[j];
           dtypeInd = currKey[0];
           col = currKey[1];
+
+          // Treat the array as an array of bytes
           ref arr = (leftDataRefs[here.id][dtypeInd]:c_ptr([0..#(leftNumElemsPerLocale[here.id]*leftColCounts[dtypeInd])] cPtrTypes[dtypeInd])).deref();
           var ptr = c_ptrTo(arr): c_ptr(uint(8));
+
+          // Now copy the bytes from the column we're merging on
 
           if dtypeInd != 11 {
 
@@ -412,6 +497,8 @@ module JoinMsg
 
         // And here you have it - all that to hash the key and figure out what locale it maps to!
         const h = keyBytes.hash();
+
+        // Storing the hash as an int(64) column so it doesn't have to be computed again
         ref arr = (leftDataRefs[here.id][3]:c_ptr([0..#(leftNumElemsPerLocale[here.id]*leftColCounts[3])] int(64))).deref();
         arr[leftNumElemsPerLocale[here.id]*(leftColCounts[3] - 1) + i] = h;
 
@@ -419,6 +506,8 @@ module JoinMsg
         destLocsLeft[i] = destLoc;
 
       }
+
+      // Same thing for the right data frame
 
       var destLocsRight: [0..#rightNumElemsPerLocale[here.id]] int;
       var strBytesByRowRight: [0..#rightNumElemsPerLocale[here.id]] int;
